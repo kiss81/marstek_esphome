@@ -2,7 +2,7 @@ substitutions:
   name: marstek-m1
   friendly_name: Marstek m1
   # Initial default capacity if no learning has occurred yet
-  default_usable_wh: "4400.0"
+  default_usable_wh: "4050.0"
 
 ## Version 1.11 - lilygo marstek v3 - added uart logging switch
 #
@@ -20,7 +20,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2025.11.0
+  min_version: 2026.3.2
   name_add_mac_suffix: false
 
   # Logic to initialize SOC and Capacity on boot based on voltage if no value is restored
@@ -41,8 +41,8 @@ esphome:
             v += p/-25000.0f; // Simple linear compensation based on power (tune as needed)
 
             float start_soc_pct = 0.0f;
-            if (v >= 3.49) start_soc_pct = 1.00;
-            else if (v >= 3.35) start_soc_pct = 0.90 + (v - 3.35) * (0.10 / 0.15);
+            if (v >= 3.47) start_soc_pct = 1.00;
+            else if (v >= 3.35) start_soc_pct = 0.90 + (v - 3.35) * (0.10 / 0.12);
             else if (v >= 3.25) start_soc_pct = 0.01 + (v - 3.25) * (0.89 / 0.1);
             else start_soc_pct = 0.0;
             
@@ -93,6 +93,10 @@ globals:
     type: float
     restore_value: yes
     initial_value: '3.35'
+  - id: led_brightness
+    type: float
+    restore_value: no
+    initial_value: '0.1' # 0.1 is 10%
 
 # Variables to remember your "Normal" power settings
   - id: normal_charge_power
@@ -1752,6 +1756,9 @@ light:
     num_leds: 1
     name: "Status LED"
     id: status_led
+    # Sets the default brightness to 10% on startup
+    default_transition_length: 0s
+    restore_mode: ALWAYS_OFF
 
 interval:
   # --- 1s INTERVAL: COULOMB COUNTING ENGINE & LEARNING LOGIC ---
@@ -1760,6 +1767,7 @@ interval:
       - lambda: |-
           float p = id(battery_power).state;
           float v_min = id(min_cell_voltage).state;
+          int msoc = id(battery_state_of_charge).state;
           float v_max = id(max_cell_voltage).state;
           if (isnan(p) || isnan(v_min) || isnan(v_max)) return;
 
@@ -1768,7 +1776,7 @@ interval:
           id(calc_soc_wh) += delta_wh;
 
           // Trigger Learning Start (Battery is Empty)
-          if (v_min <= 3.22f) {
+          if (v_min <= 3.22f | msoc <= 12) {
             id(calc_soc_wh) = 0.0f;
             id(cycle_energy_accumulator) = 0.0f;
             id(is_learning_cycle) = true;
@@ -1780,7 +1788,7 @@ interval:
           }
 
           // Trigger Learning End (Battery is Full)
-          if (v_max >= 3.49f) {
+          if (v_max >= 3.47f) {
             id(calc_soc_wh) = id(learned_usable_wh);
             if (id(is_learning_cycle) && id(cycle_energy_accumulator) > (id(learned_usable_wh) * 0.5f)) {
               id(learned_usable_wh) = id(cycle_energy_accumulator);
@@ -1799,41 +1807,49 @@ interval:
       - lambda: |-
           ESP_LOGD("status", "Modbus: %.0f, WiFi: %.0f", id(modbus_status).state, id(wifi_strength).state);
       - if:
+          # --- 🟢 CASE 1: EVERYTHING OK ---
           condition:
             lambda: |-
               return !isnan(id(modbus_status).state) && id(wifi_strength).state > -80;
           then:
             - light.turn_on:
                 id: status_led
+                brightness: !lambda return id(led_brightness);
                 red: 0%
-                green: 10%  # 🟢 Green = Modbus OK & WiFi strong
+                green: 100%
                 blue: 0%
           else:
             - if:
+                # --- 🟣 CASE 2: BOTH FAILED ---
                 condition:
                   lambda: |-
                     return isnan(id(modbus_status).state) && id(wifi_strength).state < -80;
                 then:
                   - light.turn_on:
                       id: status_led
-                      red: 10%  # 🟣 Purple = Both Modbus & WiFi failed
+                      brightness: !lambda return id(led_brightness);
+                      red: 100%
                       green: 0%
-                      blue: 10%
+                      blue: 100%
                 else:
                   - if:
+                      # --- 🔵 CASE 3: ONLY WIFI WEAK ---
                       condition:
                         lambda: |-
                           return id(wifi_strength).state < -80;
                       then:
                         - light.turn_on:
                             id: status_led
+                            brightness: !lambda return id(led_brightness);
                             red: 0%
                             green: 0%
-                            blue: 10%  # 🔵 Blue = Weak WiFi signal (< -80 dBm)
+                            blue: 100%
                       else:
+                        # --- 🔴 CASE 4: ONLY MODBUS ERROR ---
                         - light.turn_on:
                             id: status_led
-                            red: 10%  # 🔴 Red = Modbus error, WiFi OK
+                            brightness: !lambda return id(led_brightness);
+                            red: 100%
                             green: 0%
                             blue: 0%
 
