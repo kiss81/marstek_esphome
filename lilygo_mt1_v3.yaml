@@ -96,7 +96,19 @@ globals:
   - id: led_brightness
     type: float
     restore_value: no
-    initial_value: '0.1' # 0.1 is 10%
+    initial_value: '0.3' # 0.3 is 30%
+  - id: bypass_interval_days
+    type: int
+    restore_value: yes
+    initial_value: '10'  # Default to every 10 days
+  - id: days_since_last_bypass
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  - id: last_day_check_timestamp
+    type: int
+    restore_value: yes
+    initial_value: '0'
 
 # Variables to remember your "Normal" power settings
   - id: normal_charge_power
@@ -169,6 +181,19 @@ web_server:
     - id: Diagnostic
       name: "Diagnostic"
       sorting_weight: -10
+
+time:
+  - platform: sntp
+    id: sntp_time
+    on_time:
+      # Every day at midnight, increment the counter
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lambda: |-
+              id(days_since_last_bypass)++;
+              ESP_LOGI("BYPASS", "Days since last protection bypass: %d", id(days_since_last_bypass));
 
 # Set pins required for LilyGo T-CAN485 board
 output:
@@ -1520,6 +1545,16 @@ sensor:
       sorting_group_id: Diagnostic
       sorting_weight: 15
 
+  - platform: template
+    name: "Days Until Next Bypass"
+    id: days_until_bypass_sensor
+    lambda: |-
+      return id(bypass_interval_days) - id(days_since_last_bypass);
+    update_interval: 60s
+    unit_of_measurement: "days"
+    icon: mdi:calendar-clock
+    accuracy_decimals: 0
+
  # Instellingen en modi (Select en Number)
 select:
   - name: "RS485 Control Mode"
@@ -1745,6 +1780,26 @@ number:
       sorting_group_id: Control
       sorting_weight: 8
 
+  - platform: template
+    name: "Bypass Every X Days"
+    id: bypass_days_ui
+    min_value: 1
+    max_value: 30
+    step: 1
+    restore_value: yes
+    optimistic: yes
+    mode: box
+    on_value:
+      then:
+        - lambda: 'id(bypass_interval_days) = (int)x;'
+
+button:
+  - platform: template
+    name: "Force Protection Bypass Now"
+    on_press:
+      then:
+        - lambda: 'id(days_since_last_bypass) = id(bypass_interval_days);'
+
 ###############################################################################
 # LED
 ###############################################################################
@@ -1859,7 +1914,21 @@ interval:
       - lambda: |-
           float v_max = id(max_cell_voltage).state;
           float v_min = id(min_cell_voltage).state;
+          
+          // Determine if we should bypass protections today
+          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days));
 
+          if (is_bypass_day) {
+            // If we hit the target voltage during a bypass day, 
+            // we reset the counter so it doesn't stay in bypass mode forever.
+            if (v_max >= id(hv_cutoff_v)) {
+               id(days_since_last_bypass) = 0;
+               ESP_LOGI("BYPASS", "Bypass target reached. Resetting day counter.");
+            }
+            return; // Exit the lambda early: skips all cutoff logic below
+          }
+
+          // --- CHARGE CONTROL (Only runs if NOT a bypass day) ---
           // --- CHARGE CONTROL (High Voltage) ---
           if (v_max >= id(hv_cutoff_v)) {
             // Step 1: Over 3.50V - Stop Charge
