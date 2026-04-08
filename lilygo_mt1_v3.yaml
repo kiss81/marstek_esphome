@@ -186,14 +186,15 @@ time:
   - platform: sntp
     id: sntp_time
     on_time:
-      # Every day at midnight, increment the counter
       - seconds: 0
         minutes: 0
         hours: 0
         then:
           - lambda: |-
               id(days_since_last_bypass)++;
+              id(days_until_bypass_sensor).update(); // Add this line
               ESP_LOGI("BYPASS", "Days since last protection bypass: %d", id(days_since_last_bypass));
+
 
 # Set pins required for LilyGo T-CAN485 board
 output:
@@ -1550,7 +1551,7 @@ sensor:
     id: days_until_bypass_sensor
     lambda: |-
       return id(bypass_interval_days) - id(days_since_last_bypass);
-    update_interval: 60s
+    update_interval: never # Updated via button or midnight timer
     unit_of_measurement: "days"
     icon: mdi:calendar-clock
     accuracy_decimals: 0
@@ -1786,6 +1787,7 @@ number:
     min_value: 1
     max_value: 30
     step: 1
+    initial_value: 10
     restore_value: yes
     optimistic: yes
     mode: box
@@ -1798,7 +1800,10 @@ button:
     name: "Force Protection Bypass Now"
     on_press:
       then:
-        - lambda: 'id(days_since_last_bypass) = id(bypass_interval_days);'
+        - lambda: |-
+            id(days_since_last_bypass) = id(bypass_interval_days);
+            id(days_until_bypass_sensor).update(); // Force UI update immediately
+            ESP_LOGI("BYPASS", "Bypass manually triggered.");
 
 ###############################################################################
 # LED
@@ -1916,7 +1921,36 @@ interval:
           float v_min = id(min_cell_voltage).state;
           
           // Determine if we should bypass protections today
-          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days));
+          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days) || id(days_until_bypass_sensor).state <= 0);
+
+          // First we check the high voltage warnings, which apply even on bypass days (but don't cut off, just limit power)
+          if ( v_max >= (id(hv_warning_v) - 0.02) ) {
+            // Step 3: Over 3.48V - Limit to 200W
+            if (id(max_charge_power).state > 200) {
+              auto call = id(max_charge_power).make_call();
+              call.set_value(200);
+              call.perform();
+              ESP_LOGI("PROTECTION", "Max Cell Voltage Warning (%.3fV). Power limited to 200W.", v_max);
+            }
+          }
+          else if (v_max >= id(hv_warning_v)) {
+            // Over 3.40V - Limit to 400W
+            if (id(max_charge_power).state > 400) {
+              auto call = id(max_charge_power).make_call();
+              call.set_value(400);
+              call.perform();
+              ESP_LOGI("PROTECTION", "Max Cell Voltage Warning (%.3fV). Power limited to 400W.", v_max);
+            }
+          }
+          else if (v_max <= id(reset_v)) {
+            // Reset to Normal when below 3.35V
+            if (id(max_charge_power).state < id(normal_charge_power)) {
+              auto call = id(max_charge_power).make_call();
+              call.set_value(id(normal_charge_power));
+              call.perform();
+              ESP_LOGI("PROTECTION", "Cell Voltage Normalized. Charge Power restored.");
+            }
+          }
 
           if (is_bypass_day) {
             // If we hit the target voltage during a bypass day, 
@@ -1931,7 +1965,7 @@ interval:
           // --- CHARGE CONTROL (Only runs if NOT a bypass day) ---
           // --- CHARGE CONTROL (High Voltage) ---
           if (v_max >= id(hv_cutoff_v)) {
-            // Step 1: Over 3.50V - Stop Charge
+            // Step 1: Over 3.52V - Stop Charge
             if (id(max_charge_power).state != 0) {
               auto call = id(max_charge_power).make_call();
               call.set_value(0);
@@ -1939,24 +1973,6 @@ interval:
               ESP_LOGW("PROTECTION", "Max Cell Voltage High (%.3fV). Charging Stopped.", v_max);
             }
           } 
-          else if (v_max >= id(hv_warning_v)) {
-            // Step 3: Over 3.40V - Limit to 500W
-            if (id(max_charge_power).state > 500) {
-              auto call = id(max_charge_power).make_call();
-              call.set_value(500);
-              call.perform();
-              ESP_LOGI("PROTECTION", "Max Cell Voltage Warning (%.3fV). Power limited to 500W.", v_max);
-            }
-          }
-          else if (v_max <= id(reset_v)) {
-            // Reset to Normal when below 3.35V
-            if (id(max_charge_power).state < id(normal_charge_power)) {
-              auto call = id(max_charge_power).make_call();
-              call.set_value(id(normal_charge_power));
-              call.perform();
-              ESP_LOGI("PROTECTION", "Cell Voltage Normalized. Charge Power restored.");
-            }
-          }
 
           // --- DISCHARGE CONTROL (Low Voltage) ---
           if (v_min <= id(lv_cutoff_v)) {
