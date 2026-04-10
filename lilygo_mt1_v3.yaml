@@ -101,7 +101,7 @@ globals:
   - id: reset_hv
     type: float
     restore_value: yes
-    initial_value: '3.35'
+    initial_value: '3.33'
   - id: reset_lv
     type: float
     restore_value: yes
@@ -1977,7 +1977,7 @@ interval:
               call.perform();
             }
           }
-          else if (v_max <= id(reset_hv)) { // e.g., 3.35V - Normalization
+          else if (v_max <= id(reset_hv)) { // e.g., 3.33V - Normalization
             if (id(max_charge_power).state < id(normal_charge_power)) {
               auto call = id(max_charge_power).make_call();
               call.set_value(id(normal_charge_power));
