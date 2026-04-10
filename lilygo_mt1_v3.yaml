@@ -31,14 +31,24 @@ esphome:
           lambda: |-
             return !isnan(id(min_cell_voltage).state) && !isnan(id(battery_power).state);
       - lambda: |-
+          // 1. Check if we just factory reset (days counter is 0)
+          // We set it to the interval value to trigger an immediate bypass day.
+          if (id(days_since_last_bypass) == 0) {
+            id(days_since_last_bypass) = id(bypass_interval_days);
+            id(days_until_bypass_sensor).update();
+            ESP_LOGI("BOOT", "Factory reset or first run detected. Forcing bypass day for calibration.");
+          }
+
+          // Force the sensor to calculate the value so it's not "Unknown"
+          id(days_until_bypass_sensor).update();
+
+          // 2. Existing SOC Initialization logic
           if (id(calc_soc_wh) == 0 || isnan(id(calc_soc_wh))) {
             float v = id(min_cell_voltage).state;
             float p = id(battery_power).state;
             
-            // --- VOLTAGE SAG COMPENSATION ---
-            // If discharging (power is negative), the voltage is artificially low.
-            // We add a small offset (e.g., 0.05V to 0.1V) based on load to estimate resting voltage.
-            v += p/-25000.0f; // Simple linear compensation based on power (tune as needed)
+            // Voltage Sag Compensation
+            v += p/-25000.0f; 
 
             float start_soc_pct = 0.0f;
             if (v >= 3.47) start_soc_pct = 1.00;
@@ -47,8 +57,7 @@ esphome:
             else start_soc_pct = 0.0;
             
             id(calc_soc_wh) = start_soc_pct * id(learned_usable_wh);
-            ESP_LOGI("SOC_INIT", "Measured: %.3fV, Power: %.0fW -> Compensated V: %.3fV -> SOC: %.1f Wh", 
-                     id(min_cell_voltage).state, p, v, id(calc_soc_wh));
+            ESP_LOGI("SOC_INIT", "Compensated V: %.3fV -> SOC: %.1f Wh", v, id(calc_soc_wh));
           }
 
 esp32:
@@ -88,11 +97,15 @@ globals:
   - id: lv_cutoff_v
     type: float
     restore_value: yes
-    initial_value: '3.21'
-  - id: reset_v
+    initial_value: '3.20'
+  - id: reset_hv
     type: float
     restore_value: yes
     initial_value: '3.35'
+  - id: reset_lv
+    type: float
+    restore_value: yes
+    initial_value: '3.30'
   - id: led_brightness
     type: float
     restore_value: no
@@ -1827,37 +1840,62 @@ interval:
       - lambda: |-
           float p = id(battery_power).state;
           float v_min = id(min_cell_voltage).state;
-          int msoc = id(battery_state_of_charge).state;
           float v_max = id(max_cell_voltage).state;
+          int msoc = id(battery_state_of_charge).state;
+          
           if (isnan(p) || isnan(v_min) || isnan(v_max)) return;
 
-          // Coulomb Count (Wh) calculation: Power * (1 second / 3600 seconds/hour)
+          // 1. Basic Coulomb Counting (Update current SOC)
           float delta_wh = (p / 3600.0f);
           id(calc_soc_wh) += delta_wh;
 
-          // Trigger Learning Start (Battery is Empty)
-          if (v_min <= 3.22f | msoc <= 12) {
-            id(calc_soc_wh) = 0.0f;
-            id(cycle_energy_accumulator) = 0.0f;
-            id(is_learning_cycle) = true;
+          // 2. Trigger Learning START (Empty State)
+          // We only start a new learning cycle if we are truly empty.
+          if (v_min <= 3.10f || msoc <= 10) { 
+            if (!id(is_learning_cycle)) {
+              id(cycle_energy_accumulator) = 0.0f;
+              id(is_learning_cycle) = true;
+              ESP_LOGI("LEARNING", "Empty threshold hit. Starting learning cycle...");
+            }
+            id(calc_soc_wh) = 0.0f; // Force sync
           }
 
-          // Accumulate energy during charge for Capacity Learning
-          if (id(is_learning_cycle) && p > 0) {
-            id(cycle_energy_accumulator) += delta_wh;
-          }
-
-          // Trigger Learning End (Battery is Full)
-          if (v_max >= 3.47f) {
-            id(calc_soc_wh) = id(learned_usable_wh);
-            if (id(is_learning_cycle) && id(cycle_energy_accumulator) > (id(learned_usable_wh) * 0.5f)) {
-              id(learned_usable_wh) = id(cycle_energy_accumulator);
+          // 3. Accumulate Energy (Charge Only)
+          if (id(is_learning_cycle)) {
+            if (p > 5.0f) { // Only count if charging > 5W
+              id(cycle_energy_accumulator) += delta_wh;
+            } else if (p < -20.0f) {
+              // INVALIDATION: If we discharge significantly during a learning cycle, 
+              // the math becomes unreliable. Reset and wait for next empty state.
               id(is_learning_cycle) = false;
-              ESP_LOGI("CAPACITY", "Learned new capacity: %.1f Wh", id(learned_usable_wh));
+              ESP_LOGW("LEARNING", "Discharge detected during learning. Cycle invalidated.");
             }
           }
 
-          // Bound checking
+          // 4. Trigger Learning END (Full State)
+          if (v_max >= 3.50f) {
+            id(calc_soc_wh) = id(learned_usable_wh); // Force sync to 100%
+            
+            if (id(is_learning_cycle)) {
+              float new_cap = id(cycle_energy_accumulator);
+              float current_cap = id(learned_usable_wh);
+
+              // SANITY CHECK:
+              // Only accept new capacity if it's within 15% of current or if current is default.
+              // This prevents a "glitch" from setting your battery to 10,000Wh or 10Wh.
+              float deviation = fabsf(new_cap - current_cap) / current_cap;
+              
+              if (new_cap > 500.0f && (deviation < 0.15f || current_cap == 4050.0f)) {
+                id(learned_usable_wh) = new_cap;
+                ESP_LOGI("LEARNING", "Success! New Capacity: %.1f Wh (Dev: %.1f%%)", new_cap, deviation * 100.0);
+              } else {
+                ESP_LOGW("LEARNING", "Cycle finished but rejected. New: %.1f Wh, Current: %.1f Wh", new_cap, current_cap);
+              }
+              id(is_learning_cycle) = false;
+            }
+          }
+
+          // 5. Hard Bounds
           if (id(calc_soc_wh) > id(learned_usable_wh)) id(calc_soc_wh) = id(learned_usable_wh);
           if (id(calc_soc_wh) < 0) id(calc_soc_wh) = 0;
 
@@ -1942,13 +1980,22 @@ interval:
               ESP_LOGI("PROTECTION", "Max Cell Voltage Warning (%.3fV). Power limited to 400W.", v_max);
             }
           }
-          else if (v_max <= id(reset_v)) {
+          else if (v_max <= id(reset_hv)) {
             // Reset to Normal when below 3.35V
             if (id(max_charge_power).state < id(normal_charge_power)) {
               auto call = id(max_charge_power).make_call();
               call.set_value(id(normal_charge_power));
               call.perform();
               ESP_LOGI("PROTECTION", "Cell Voltage Normalized. Charge Power restored.");
+            }
+           }
+          else if (v_min >= id(reset_lv)) {
+            // Reset to Normal when above 3.3V
+            if (id(max_discharge_power).state < id(normal_discharge_power)) {
+              auto call = id(max_discharge_power).make_call();
+              call.set_value(id(normal_discharge_power));
+              call.perform();
+              ESP_LOGI("PROTECTION", "Cell Voltage Normalized. Discharge Power restored.");
             }
           }
 
@@ -1976,20 +2023,11 @@ interval:
 
           // --- DISCHARGE CONTROL (Low Voltage) ---
           if (v_min <= id(lv_cutoff_v)) {
-            // Step 2: Below 3.21V - Stop Discharge
+            // Step 2: Below 3.20V - Stop Discharge
             if (id(max_discharge_power).state != 0) {
               auto call = id(max_discharge_power).make_call();
               call.set_value(0);
               call.perform();
               ESP_LOGW("PROTECTION", "Min Cell Voltage Low (%.3fV). Discharging Stopped.", v_min);
-            }
-          }
-          else if (v_min >= id(reset_v)) {
-            // Reset to Normal when above 3.35V
-            if (id(max_discharge_power).state < id(normal_discharge_power)) {
-              auto call = id(max_discharge_power).make_call();
-              call.set_value(id(normal_discharge_power));
-              call.perform();
-              ESP_LOGI("PROTECTION", "Cell Voltage Normalized. Discharge Power restored.");
             }
           }
