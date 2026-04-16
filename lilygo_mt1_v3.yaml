@@ -2,7 +2,7 @@ substitutions:
   name: marstek-m1
   friendly_name: Marstek m1
   # Initial default capacity if no learning has occurred yet
-  default_usable_wh: "4050.0"
+  default_usable_wh: "4000.0"
 
 ## Version 1.11 - lilygo marstek v3 - added uart logging switch
 #
@@ -1841,61 +1841,58 @@ interval:
           float p = id(battery_power).state;
           float v_min = id(min_cell_voltage).state;
           float v_max = id(max_cell_voltage).state;
-          int msoc = id(battery_state_of_charge).state;
           
           if (isnan(p) || isnan(v_min) || isnan(v_max)) return;
 
-          // 1. Basic Coulomb Counting (Update current SOC)
+          // 1. Basic Coulomb Counting (Energy Delta in Wh)
           float delta_wh = (p / 3600.0f);
           id(calc_soc_wh) += delta_wh;
 
-          // 2. Trigger Learning START (Empty State)
-          // We only start a new learning cycle if we are truly empty.
-          if (v_min <= 3.10f || msoc <= 10) { 
+          // 2. TRIGGER: Learning START (Battery is "Empty" at 3.20V)
+          // We trigger slightly above the limit (+0.01) to ensure it fires 
+          // before the hard cutoff stops all activity.
+          if (v_min <= (id(lv_cutoff_v) + 0.01f)) { 
             if (!id(is_learning_cycle)) {
               id(cycle_energy_accumulator) = 0.0f;
               id(is_learning_cycle) = true;
-              ESP_LOGI("LEARNING", "Empty threshold hit. Starting learning cycle...");
+              ESP_LOGI("LEARNING", "0%% SOC reached (%.2fV). Starting capacity accumulation...", v_min);
             }
-            id(calc_soc_wh) = 0.0f; // Force sync
+            id(calc_soc_wh) = 0.0f; // Sync internal SOC to 0
           }
 
           // 3. Accumulate Energy (Charge Only)
           if (id(is_learning_cycle)) {
-            if (p > 5.0f) { // Only count if charging > 5W
+            if (p > 2.0f) { // Only count while actually charging
               id(cycle_energy_accumulator) += delta_wh;
-            } else if (p < -20.0f) {
-              // INVALIDATION: If we discharge significantly during a learning cycle, 
-              // the math becomes unreliable. Reset and wait for next empty state.
-              id(is_learning_cycle) = false;
-              ESP_LOGW("LEARNING", "Discharge detected during learning. Cycle invalidated.");
             }
+            // Removed strict invalidation. The cycle stays active until 100% is hit.
           }
 
-          // 4. Trigger Learning END (Full State)
-          if (v_max >= 3.50f) {
-            id(calc_soc_wh) = id(learned_usable_wh); // Force sync to 100%
+          // 4. TRIGGER: Learning END (Battery is "Full" at 3.50V)
+          if (v_max >= id(hv_cutoff_v)) {
+            id(calc_soc_wh) = id(learned_usable_wh); // Sync internal SOC to 100%
             
             if (id(is_learning_cycle)) {
               float new_cap = id(cycle_energy_accumulator);
               float current_cap = id(learned_usable_wh);
-
-              // SANITY CHECK:
-              // Only accept new capacity if it's within 15% of current or if current is default.
-              // This prevents a "glitch" from setting your battery to 10,000Wh or 10Wh.
-              float deviation = fabsf(new_cap - current_cap) / current_cap;
               
-              if (new_cap > 500.0f && (deviation < 0.15f || current_cap == 4050.0f)) {
-                id(learned_usable_wh) = new_cap;
-                ESP_LOGI("LEARNING", "Success! New Capacity: %.1f Wh (Dev: %.1f%%)", new_cap, deviation * 100.0);
-              } else {
-                ESP_LOGW("LEARNING", "Cycle finished but rejected. New: %.1f Wh, Current: %.1f Wh", new_cap, current_cap);
+              // Only process if we accumulated a realistic amount of energy (>500Wh)
+              if (new_cap > 500.0f) {
+                float deviation = fabsf(new_cap - current_cap) / current_cap;
+                
+                // Safety Check: Accept if it's the first time (4000) OR within 20% of current
+                if (current_cap == 4000.0f || deviation < 0.20f) {
+                  id(learned_usable_wh) = new_cap;
+                  ESP_LOGI("LEARNING", "SUCCESS! New capacity: %.1f Wh (Dev: %.1f%%)", new_cap, deviation * 100.0);
+                } else {
+                  ESP_LOGW("LEARNING", "REJECTED: New value %.1f Wh varies too much from %.1f Wh", new_cap, current_cap);
+                }
               }
-              id(is_learning_cycle) = false;
+              id(is_learning_cycle) = false; // Reset for next cycle
             }
           }
 
-          // 5. Hard Bounds
+          // 5. Keep Internal Wh within learned bounds
           if (id(calc_soc_wh) > id(learned_usable_wh)) id(calc_soc_wh) = id(learned_usable_wh);
           if (id(calc_soc_wh) < 0) id(calc_soc_wh) = 0;
 
@@ -1963,17 +1960,17 @@ interval:
 
           // --- 1. CHARGE POWER LIMITS (Warnings) ---
           // These apply even on bypass days to prevent cell damage while top-balancing
-          if (v_max >= (id(hv_warning_v) + 0.08)) { // e.g., 3.48V
-            if (id(max_charge_power).state > 200) {
+          if (v_max > (id(hv_warning_v) + 0.08)) { // e.g., 3.49V
+            if (id(max_charge_power).state > 300) {
               auto call = id(max_charge_power).make_call();
-              call.set_value(200);
+              call.set_value(300);
               call.perform();
             }
           }
           else if (v_max >= id(hv_warning_v)) { // e.g., 3.40V
-            if (id(max_charge_power).state > 400) {
+            if (id(max_charge_power).state > 600) {
               auto call = id(max_charge_power).make_call();
-              call.set_value(400);
+              call.set_value(600);
               call.perform();
             }
           }
