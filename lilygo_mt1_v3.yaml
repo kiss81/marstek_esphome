@@ -98,14 +98,6 @@ globals:
     type: float
     restore_value: yes
     initial_value: '3.20'
-  - id: reset_hv
-    type: float
-    restore_value: yes
-    initial_value: '3.33'
-  - id: reset_lv
-    type: float
-    restore_value: yes
-    initial_value: '3.30'
   - id: led_brightness
     type: float
     restore_value: no
@@ -122,7 +114,20 @@ globals:
     type: int
     restore_value: yes
     initial_value: '0'
-
+  # Configuration: How many % SOC must change to reset power to normal
+  - id: soc_reset_delta_pct
+    type: float
+    restore_value: yes
+    initial_value: '10.0' 
+  # Trackers: Remembers the SOC when a limit was first hit
+  - id: charge_limit_applied_soc
+    type: float
+    restore_value: no
+    initial_value: '0'
+  - id: discharge_limit_applied_soc
+    type: float
+    restore_value: no
+    initial_value: '-1.0' # -1 used as a "not tracking" flag
 # Variables to remember your "Normal" power settings
   - id: normal_charge_power
     type: float
@@ -1955,72 +1960,73 @@ interval:
           float v_max = id(max_cell_voltage).state;
           float v_min = id(min_cell_voltage).state;
           
-          // Determine if we should bypass protections today
+          // Calculate current SOC for the reset logic
+          float current_soc = (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0f;
+          
           bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days) || id(days_until_bypass_sensor).state <= 0);
 
-          // --- 1. CHARGE POWER LIMITS (Warnings) ---
-          // These apply even on bypass days to prevent cell damage while top-balancing
+          // --- 1. APPLY CHARGE LIMITS (Warnings) ---
           if (v_max > (id(hv_warning_v) + 0.08)) { // e.g., 3.49V
             if (id(max_charge_power).state > 300) {
-              auto call = id(max_charge_power).make_call();
-              call.set_value(300);
-              call.perform();
+              id(max_charge_power).make_call().set_value(300).perform();
             }
           }
           else if (v_max >= id(hv_warning_v)) { // e.g., 3.40V
             if (id(max_charge_power).state > 600) {
-              auto call = id(max_charge_power).make_call();
-              call.set_value(600);
-              call.perform();
-            }
-          }
-          else if (v_max <= id(reset_hv)) { // e.g., 3.33V - Normalization
-            if (id(max_charge_power).state < id(normal_charge_power)) {
-              auto call = id(max_charge_power).make_call();
-              call.set_value(id(normal_charge_power));
-              call.perform();
+              id(max_charge_power).make_call().set_value(600).perform();
             }
           }
 
-          // --- 2. DISCHARGE POWER NORMALIZATION ---
-          if (v_min >= id(reset_lv)) { // e.g., 3.30V
-            if (id(max_discharge_power).state < id(normal_discharge_power)) {
-              auto call = id(max_discharge_power).make_call();
-              call.set_value(id(normal_discharge_power));
-              call.perform();
-            }
-          }
-
-          // --- 3. THE BYPASS OVERRIDE ---
+          // --- 2. HARD CUTOFFS & BYPASS ---
           if (is_bypass_day) {
-            // Reset bypass counter if we hit the top target
             if (v_max >= id(hv_cutoff_v)) {
                id(days_since_last_bypass) = 0;
                ESP_LOGI("BYPASS", "Full charge reached. Bypass cycle complete.");
             }
-            
-            // LOGGING: Notify that we are ignoring low/high cutoffs
-            ESP_LOGD("BYPASS", "Bypass Active: Ignoring 0W cutoffs for calibration.");
-            
-            return; // EXIT EARLY: Skips the 0W hard cutoffs below
-          }
-
-          // --- 4. HARD CUTOFFS (Only if NOT a bypass day) ---
-          
-          // Stop charging at HV Cutoff (3.50V)
-          if (v_max >= id(hv_cutoff_v)) {
-            if (id(max_charge_power).state != 0) {
-              auto call = id(max_charge_power).make_call();
-              call.set_value(0);
-              call.perform();
+          } else {
+            // Apply 0W Hard Cutoffs only if NOT a bypass day
+            if (v_max >= id(hv_cutoff_v)) {
+              if (id(max_charge_power).state != 0) {
+                id(max_charge_power).make_call().set_value(0).perform();
+              }
+            }
+            if (v_min <= id(lv_cutoff_v)) {
+              if (id(max_discharge_power).state != 0) {
+                id(max_discharge_power).make_call().set_value(0).perform();
+              }
             }
           }
 
-          // Stop discharging at LV Cutoff (3.20V)
-          if (v_min <= id(lv_cutoff_v)) {
-            if (id(max_discharge_power).state != 0) {
-              auto call = id(max_discharge_power).make_call();
-              call.set_value(0);
-              call.perform();
+          // --- 3. SOC-BASED NORMALIZATION (RESETS) ---
+
+          // CHARGE RESET: Reset to normal after a 10% discharge from the peak SOC
+          if (id(max_charge_power).state < id(normal_charge_power)) {
+            // Record/Update the peak SOC reached while charging was limited
+            if (current_soc > id(charge_limit_applied_soc)) {
+              id(charge_limit_applied_soc) = current_soc;
             }
+            // Check if we have discharged enough (e.g., 10%) from that peak
+            if (current_soc <= (id(charge_limit_applied_soc) - id(soc_reset_delta_pct))) {
+              id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
+              id(charge_limit_applied_soc) = 0.0f;
+              ESP_LOGI("RESET", "Charge power normalized. Dropped 10%% SOC from peak.");
+            }
+          } else {
+            id(charge_limit_applied_soc) = 0.0f;
+          }
+
+          // DISCHARGE RESET: Reset to normal after a 10% charge from the trough SOC
+          if (id(max_discharge_power).state < id(normal_discharge_power)) {
+            // Record/Update the lowest SOC reached while discharging was limited
+            if (id(discharge_limit_applied_soc) < 0.0f || current_soc < id(discharge_limit_applied_soc)) {
+              id(discharge_limit_applied_soc) = current_soc;
+            }
+            // Check if we have charged enough (e.g., 10%) from that bottom point
+            if (current_soc >= (id(discharge_limit_applied_soc) + id(soc_reset_delta_pct))) {
+              id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform();
+              id(discharge_limit_applied_soc) = -1.0f;
+              ESP_LOGI("RESET", "Discharge power normalized. Rose 10%% SOC from bottom.");
+            }
+          } else {
+            id(discharge_limit_applied_soc) = -1.0f;
           }
