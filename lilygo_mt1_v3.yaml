@@ -20,7 +20,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2026.3.2
+  min_version: 2026.4.2
   name_add_mac_suffix: false
 
   # Logic to initialize SOC and Capacity on boot based on voltage if no value is restored
@@ -35,7 +35,6 @@ esphome:
           bool is_first_boot = (id(days_since_last_bypass) == 0);
           
           if (is_first_boot) {
-            // Start fresh with 0 days elapsed, so the bypass counter starts from the default interval
             id(days_since_last_bypass) = 0;
             id(days_until_bypass_sensor).update();
             ESP_LOGI("BOOT", "Factory reset or first run detected. Bypass counter initialized.");
@@ -81,6 +80,10 @@ globals:
     type: float
     restore_value: yes
     initial_value: ${default_usable_wh}
+  - id: charge_efficiency
+    type: float
+    restore_value: yes
+    initial_value: '0.96' # 96% efficiency to prevent drift during charging
   - id: cycle_energy_accumulator
     type: float
     restore_value: no
@@ -1807,7 +1810,7 @@ number:
     name: "Bypass Every X Days"
     id: bypass_days_ui
     min_value: 1
-    max_value: 30
+    max_value: 60
     step: 1
     initial_value: 15
     restore_value: yes
@@ -1843,78 +1846,77 @@ light:
     restore_mode: ALWAYS_OFF
 
 interval:
-  # --- 1s INTERVAL: COULOMB COUNTING ENGINE & LEARNING LOGIC ---
+  # --- 1s INTERVAL: REFINED COULOMB COUNTING & LEARNING ENGINE ---
   - interval: 1s
     then:
       - lambda: |-
           float p = id(battery_power).state;
           float v_min = id(min_cell_voltage).state;
           float v_max = id(max_cell_voltage).state;
+          float marstek_soc = id(battery_state_of_charge).state;
           
-          if (isnan(p) || isnan(v_min) || isnan(v_max)) return;
+          if (isnan(p) || isnan(v_min) || isnan(v_max) || isnan(marstek_soc)) return;
 
-          // 1. Basic Coulomb Counting (Energy Delta in Wh)
+          // 1. Precise Integration with Charge Efficiency
           float delta_wh = (p / 3600.0f);
-          id(calc_soc_wh) += delta_wh;
+          if (p > 0) {
+            // Charging: apply efficiency (96%)
+            id(calc_soc_wh) += (delta_wh * id(charge_efficiency));
+          } else {
+            // Discharging: 1:1 ratio
+            id(calc_soc_wh) += delta_wh; 
+          }
 
-          // 2. TRIGGER: Learning START (Battery is "Empty" at 3.20V)
-          // We trigger slightly above the limit (+0.01) to ensure it fires 
-          // before the hard cutoff stops all activity.
-          if (v_min <= (id(lv_cutoff_v) + 0.01f)) { 
+          // 2. TRIGGER: Empty Sync (0% SOC)
+          // Uses both Voltage (3.20V) and Marstek SOC (12%) as the floor
+          if (v_min <= (id(lv_cutoff_v) + 0.01f) || marstek_soc <= 12.0f) { 
             if (!id(is_learning_cycle)) {
               id(cycle_energy_accumulator) = 0.0f;
               id(is_learning_cycle) = true;
-              ESP_LOGI("LEARNING", "0%% SOC reached (%.2fV). Starting capacity accumulation...", v_min);
+              ESP_LOGI("LEARNING", "Empty floor reached (V:%.2f, BMS:%.0f%%). Learning started.", v_min, marstek_soc);
             }
-            id(calc_soc_wh) = 0.0f; // Sync internal SOC to 0
+            id(calc_soc_wh) = 0.0f; 
           }
 
-          // 3. Accumulate Energy (Charge Only)
-          if (id(is_learning_cycle)) {
-            if (p > 2.0f) { // Only count while actually charging
-              id(cycle_energy_accumulator) += delta_wh;
-            }
-            // Removed strict invalidation. The cycle stays active until 100% is hit.
+          // 3. Accumulate Energy (Charge Only, RAW power)
+          if (id(is_learning_cycle) && p > 2.0f) {
+             id(cycle_energy_accumulator) += (delta_wh * id(charge_efficiency));
           }
 
-          // 4. TRIGGER: Learning END (Battery is "Full" at 3.50V)
+          // 4. TRIGGER: Full Sync (100% SOC)
           if (v_max >= id(hv_cutoff_v)) {
-            id(calc_soc_wh) = id(learned_usable_wh); // Sync internal SOC to 100%
-            
-            if (id(is_learning_cycle)) {
-              float new_cap = id(cycle_energy_accumulator);
-              float current_cap = id(learned_usable_wh);
-              
-              // Only process if we accumulated a realistic amount of energy (>500Wh)
-              if (new_cap > 500.0f) {
-                float deviation = fabsf(new_cap - current_cap) / current_cap;
-                
-                // Safety Check: Accept if it's the first time (4000) OR within 20% of current
-                if (current_cap == 4000.0f || deviation < 0.20f) {
-                  id(learned_usable_wh) = new_cap;
-                  ESP_LOGI("LEARNING", "SUCCESS! New capacity: %.1f Wh (Dev: %.1f%%)", new_cap, deviation * 100.0);
-                } else {
-                  ESP_LOGW("LEARNING", "REJECTED: New value %.1f Wh varies too much from %.1f Wh", new_cap, current_cap);
-                }
-              }
-              id(is_learning_cycle) = false; // Reset for next cycle
+            id(calc_soc_wh) = id(learned_usable_wh); 
+
+             if (id(is_learning_cycle)) {
+               float new_cap = id(cycle_energy_accumulator);
+               float current_cap = id(learned_usable_wh);
+               
+               // Only process if we accumulated a realistic amount of energy (>500Wh)
+               if (new_cap > 500.0f) {
+                 float deviation = fabsf(new_cap - current_cap) / current_cap;
+                 
+                 // Safety Check: Accept if it's the first time (4000) OR within 20% of current
+                 if (current_cap == 4000.0f || deviation < 0.20f) {
+                   id(learned_usable_wh) = new_cap;
+                   ESP_LOGI("LEARNING", "SUCCESS! New capacity: %.1f Wh (Dev: %.1f%%)", new_cap, deviation * 100.0);
+                 } else {
+                   ESP_LOGW("LEARNING", "REJECTED: New value %.1f Wh varies too much from %.1f Wh", new_cap, current_cap);
+                 }
+               }
+               id(is_learning_cycle) = false; // Reset for next cycle
             }
           }
 
-          // 5. Keep Internal Wh within learned bounds
+          // 5. Safety Bounds
           if (id(calc_soc_wh) > id(learned_usable_wh)) id(calc_soc_wh) = id(learned_usable_wh);
           if (id(calc_soc_wh) < 0) id(calc_soc_wh) = 0;
 
-  # --- 5s INTERVAL: ORIGINAL LED & STATUS LOGIC ---
+  # --- 5s INTERVAL: LED STATUS ---
   - interval: 5s
     then:
-      - lambda: |-
-          ESP_LOGD("status", "Modbus: %.0f, WiFi: %.0f", id(modbus_status).state, id(wifi_strength).state);
       - if:
-          # --- 🟢 CASE 1: EVERYTHING OK ---
           condition:
-            lambda: |-
-              return !isnan(id(modbus_status).state) && id(wifi_strength).state > -80;
+            lambda: return !isnan(id(modbus_status).state) && id(wifi_strength).state > -80;
           then:
             - light.turn_on:
                 id: status_led
@@ -1963,79 +1965,42 @@ interval:
       - lambda: |-
           float v_max = id(max_cell_voltage).state;
           float v_min = id(min_cell_voltage).state;
+          if (isnan(v_max) || isnan(v_min)) return;
           
-          // Safety: Skip cutoff logic if voltages are not yet valid (NaN)
-          if (isnan(v_max) || isnan(v_min)) {
-            return;
-          }
-          
-          // Calculate current SOC for the reset logic
           float current_soc = (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0f;
-          
-          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days) || id(days_until_bypass_sensor).state <= 0);
+          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days));
 
-          // --- 1. APPLY CHARGE LIMITS (Warnings) ---
-          if (v_max > (id(hv_warning_v) + 0.08)) { // e.g., 3.49V
-            if (id(max_charge_power).state > 300) {
-              id(max_charge_power).make_call().set_value(300).perform();
-            }
-          }
-          else if (v_max >= id(hv_warning_v)) { // e.g., 3.40V
-            if (id(max_charge_power).state > 600) {
-              id(max_charge_power).make_call().set_value(600).perform();
-            }
+          // 1. Apply Warnings (Tapering)
+          if (v_max > (id(hv_warning_v) + 0.08)) {
+            if (id(max_charge_power).state > 300) id(max_charge_power).make_call().set_value(300).perform();
+          } else if (v_max >= id(hv_warning_v)) {
+            if (id(max_charge_power).state > 600) id(max_charge_power).make_call().set_value(600).perform();
           }
 
-          // --- 2. HARD CUTOFFS & BYPASS ---
+          // 2. Hard Cutoffs
           if (is_bypass_day) {
-            if (v_max >= id(hv_cutoff_v)) {
-               id(days_since_last_bypass) = 0;
-               ESP_LOGI("BYPASS", "Full charge reached. Bypass cycle complete.");
-            }
+            if (v_max >= id(hv_cutoff_v)) id(days_since_last_bypass) = 0;
           } else {
-            // Apply 0W Hard Cutoffs only if NOT a bypass day
             if (v_max >= id(hv_cutoff_v)) {
-              if (id(max_charge_power).state != 0) {
-                id(max_charge_power).make_call().set_value(0).perform();
-              }
+              if (id(max_charge_power).state != 0) id(max_charge_power).make_call().set_value(0).perform();
             }
             if (v_min <= id(lv_cutoff_v)) {
-              if (id(max_discharge_power).state != 0) {
-                id(max_discharge_power).make_call().set_value(0).perform();
-              }
+              if (id(max_discharge_power).state != 0) id(max_discharge_power).make_call().set_value(0).perform();
             }
           }
 
-          // --- 3. SOC-BASED NORMALIZATION (RESETS) ---
-
-          // CHARGE RESET: Reset to normal after a 10% discharge from the peak SOC
+          // 3. Normalization Resets (10% Change)
           if (id(max_charge_power).state < id(normal_charge_power)) {
-            // Record/Update the peak SOC reached while charging was limited
-            if (current_soc > id(charge_limit_applied_soc)) {
-              id(charge_limit_applied_soc) = current_soc;
-            }
-            // Check if we have discharged enough (e.g., 10%) from that peak
+            if (current_soc > id(charge_limit_applied_soc)) id(charge_limit_applied_soc) = current_soc;
             if (current_soc <= (id(charge_limit_applied_soc) - id(soc_reset_delta_pct))) {
               id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
               id(charge_limit_applied_soc) = 0.0f;
-              ESP_LOGI("RESET", "Charge power normalized. Dropped 10%% SOC from peak.");
             }
-          } else {
-            id(charge_limit_applied_soc) = 0.0f;
           }
-
-          // DISCHARGE RESET: Reset to normal after a 10% charge from the trough SOC
           if (id(max_discharge_power).state < id(normal_discharge_power)) {
-            // Record/Update the lowest SOC reached while discharging was limited
-            if (id(discharge_limit_applied_soc) < 0.0f || current_soc < id(discharge_limit_applied_soc)) {
-              id(discharge_limit_applied_soc) = current_soc;
-            }
-            // Check if we have charged enough (e.g., 10%) from that bottom point
+            if (id(discharge_limit_applied_soc) < 0.0f || current_soc < id(discharge_limit_applied_soc)) id(discharge_limit_applied_soc) = current_soc;
             if (current_soc >= (id(discharge_limit_applied_soc) + id(soc_reset_delta_pct))) {
               id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform();
               id(discharge_limit_applied_soc) = -1.0f;
-              ESP_LOGI("RESET", "Discharge power normalized. Rose 10%% SOC from bottom.");
             }
-          } else {
-            id(discharge_limit_applied_soc) = -1.0f;
           }
