@@ -35,10 +35,10 @@ esphome:
           bool is_first_boot = (id(days_since_last_bypass) == 0);
           
           if (is_first_boot) {
-            // We set it to the interval value to trigger an immediate bypass day.
-            id(days_since_last_bypass) = id(bypass_interval_days);
+            // Start fresh with 0 days elapsed, so the bypass counter starts from the default interval
+            id(days_since_last_bypass) = 0;
             id(days_until_bypass_sensor).update();
-            ESP_LOGI("BOOT", "Factory reset or first run detected. Forcing bypass day for calibration.");
+            ESP_LOGI("BOOT", "Factory reset or first run detected. Bypass counter initialized.");
             
             // 2. Initialize SOC from voltage ONLY on first boot/factory reset
             float v = id(min_cell_voltage).state;
@@ -109,7 +109,7 @@ globals:
   - id: bypass_interval_days
     type: int
     restore_value: yes
-    initial_value: '10'  # Default to every 10 days
+    initial_value: '15'  # Default to every 15 days
   - id: days_since_last_bypass
     type: int
     restore_value: yes
@@ -1809,7 +1809,7 @@ number:
     min_value: 1
     max_value: 30
     step: 1
-    initial_value: 10
+    initial_value: 15
     restore_value: yes
     optimistic: yes
     mode: box
