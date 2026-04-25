@@ -31,19 +31,16 @@ esphome:
           lambda: |-
             return !isnan(id(min_cell_voltage).state) && !isnan(id(battery_power).state);
       - lambda: |-
-          // 1. Check if we just factory reset (days counter is 0)
-          // We set it to the interval value to trigger an immediate bypass day.
-          if (id(days_since_last_bypass) == 0) {
+          // 1. Check if we just factory reset or first boot (days counter is 0)
+          bool is_first_boot = (id(days_since_last_bypass) == 0);
+          
+          if (is_first_boot) {
+            // We set it to the interval value to trigger an immediate bypass day.
             id(days_since_last_bypass) = id(bypass_interval_days);
             id(days_until_bypass_sensor).update();
             ESP_LOGI("BOOT", "Factory reset or first run detected. Forcing bypass day for calibration.");
-          }
-
-          // Force the sensor to calculate the value so it's not "Unknown"
-          id(days_until_bypass_sensor).update();
-
-          // 2. Existing SOC Initialization logic
-          if (id(calc_soc_wh) == 0 || isnan(id(calc_soc_wh))) {
+            
+            // 2. Initialize SOC from voltage ONLY on first boot/factory reset
             float v = id(min_cell_voltage).state;
             float p = id(battery_power).state;
             
@@ -57,8 +54,15 @@ esphome:
             else start_soc_pct = 0.0;
             
             id(calc_soc_wh) = start_soc_pct * id(learned_usable_wh);
-            ESP_LOGI("SOC_INIT", "Compensated V: %.3fV -> SOC: %.1f Wh", v, id(calc_soc_wh));
+            ESP_LOGI("SOC_INIT", "First boot/Factory reset. Compensated V: %.3fV -> SOC: %.1f Wh", v, id(calc_soc_wh));
+          } else {
+            // Normal restart: trust the restored value from flash
+            ESP_LOGI("BOOT", "Normal restart. SOC restored from flash: %.1f Wh (%.1f%%)", 
+              id(calc_soc_wh), (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0);
           }
+
+          // Force the sensor to calculate the value so it's not "Unknown"
+          id(days_until_bypass_sensor).update();
 
 esp32:
   board: esp32dev
@@ -1959,6 +1963,11 @@ interval:
       - lambda: |-
           float v_max = id(max_cell_voltage).state;
           float v_min = id(min_cell_voltage).state;
+          
+          // Safety: Skip cutoff logic if voltages are not yet valid (NaN)
+          if (isnan(v_max) || isnan(v_min)) {
+            return;
+          }
           
           // Calculate current SOC for the reset logic
           float current_soc = (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0f;
