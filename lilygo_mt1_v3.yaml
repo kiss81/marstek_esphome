@@ -1968,7 +1968,7 @@ interval:
           if (isnan(v_max) || isnan(v_min)) return;
           
           float current_soc = (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0f;
-          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days));
+          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days) || id(days_until_bypass_sensor).state <= 0);
 
           // 1. Apply Warnings (Tapering)
           if (v_max > (id(hv_warning_v) + 0.08)) {
