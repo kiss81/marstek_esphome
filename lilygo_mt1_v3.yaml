@@ -20,7 +20,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2026.4.2
+  min_version: 2026.4.3
   name_add_mac_suffix: false
 
   # Logic to initialize SOC and Capacity on boot based on voltage if no value is restored
@@ -31,19 +31,14 @@ esphome:
           lambda: |-
             return !isnan(id(min_cell_voltage).state) && !isnan(id(battery_power).state);
       - lambda: |-
-          // 1. Check if we just factory reset or first boot (days counter is 0)
-          bool is_first_boot = (id(days_since_last_bypass) == 0);
-          
-          if (is_first_boot) {
-            id(days_since_last_bypass) = 0;
-            id(days_until_bypass_sensor).update();
-            ESP_LOGI("BOOT", "Factory reset or first run detected. Bypass counter initialized.");
+          // Check if we have a valid restored SOC from a previous session
+          if (!id(soc_initialized)) {
+            ESP_LOGI("BOOT", "First run/Reset detected. Initializing SOC from voltage.");
             
-            // 2. Initialize SOC from voltage ONLY on first boot/factory reset
             float v = id(min_cell_voltage).state;
             float p = id(battery_power).state;
             
-            // Voltage Sag Compensation
+            // Voltage Sag Compensation logic
             v += p/-25000.0f; 
 
             float start_soc_pct = 0.0f;
@@ -53,15 +48,20 @@ esphome:
             else start_soc_pct = 0.0;
             
             id(calc_soc_wh) = start_soc_pct * id(learned_usable_wh);
-            ESP_LOGI("SOC_INIT", "First boot/Factory reset. Compensated V: %.3fV -> SOC: %.1f Wh", v, id(calc_soc_wh));
+            id(soc_initialized) = true; // Mark as initialized so this doesn't run on normal restarts
+            
+            ESP_LOGI("SOC_INIT", "Voltage-based Sync: Compensated V: %.3fV -> SOC: %.1f Wh", v, id(calc_soc_wh));
           } else {
             // Normal restart: trust the restored value from flash
-            ESP_LOGI("BOOT", "Normal restart. SOC restored from flash: %.1f Wh (%.1f%%)", 
+            ESP_LOGI("BOOT", "Normal restart. Restored SOC: %.1f Wh (%.1f%%)", 
               id(calc_soc_wh), (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0);
           }
 
-          // Force the sensor to calculate the value so it's not "Unknown"
-          id(days_until_bypass_sensor).update();
+          // Initialize power limits to defaults
+          if (!isnan(id(max_discharge_power).state)) {
+            id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform();
+            id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
+          }
 
 esp32:
   board: esp32dev
@@ -76,6 +76,10 @@ globals:
     type: float
     restore_value: yes
     initial_value: '0'
+  - id: soc_initialized  # <--- New flag to detect if SOC has ever been set
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
   - id: learned_usable_wh
     type: float
     restore_value: yes
@@ -83,7 +87,7 @@ globals:
   - id: charge_efficiency
     type: float
     restore_value: yes
-    initial_value: '0.96' # 96% efficiency to prevent drift during charging
+    initial_value: '0.96'
   - id: cycle_energy_accumulator
     type: float
     restore_value: no
@@ -92,15 +96,10 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-# 1. cuttof globals
   - id: hv_cutoff_v
     type: float
     restore_value: yes
-    initial_value: '3.50'
-  - id: hv_warning_v
-    type: float
-    restore_value: yes
-    initial_value: '3.40'
+    initial_value: '3.55' # Updated to 3.55V
   - id: lv_cutoff_v
     type: float
     restore_value: yes
@@ -108,25 +107,11 @@ globals:
   - id: led_brightness
     type: float
     restore_value: no
-    initial_value: '0.3' # 0.3 is 30%
-  - id: bypass_interval_days
-    type: int
-    restore_value: yes
-    initial_value: '15'  # Default to every 15 days
-  - id: days_since_last_bypass
-    type: int
-    restore_value: yes
-    initial_value: '0'
-  - id: last_day_check_timestamp
-    type: int
-    restore_value: yes
-    initial_value: '0'
-  # Configuration: How many % SOC must change to reset power to normal
+    initial_value: '0.3'
   - id: soc_reset_delta_pct
     type: float
     restore_value: yes
     initial_value: '10.0' 
-  # Trackers: Remembers the SOC when a limit was first hit
   - id: charge_limit_applied_soc
     type: float
     restore_value: no
@@ -134,16 +119,27 @@ globals:
   - id: discharge_limit_applied_soc
     type: float
     restore_value: no
-    initial_value: '-1.0' # -1 used as a "not tracking" flag
-# Variables to remember your "Normal" power settings
+    initial_value: '-1.0'
   - id: normal_charge_power
     type: float
     restore_value: yes
-    initial_value: '2000' # Change this to your preferred default
+    initial_value: '2000'
   - id: normal_discharge_power
     type: float
     restore_value: yes
-    initial_value: '2000' # Change this to your preferred default
+    initial_value: '2000'
+  - id: manual_bypass_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: charge_cutoff_triggered
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: discharge_cutoff_triggered
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 logger:
   level: ERROR  # Set global level to VERBOSE to allow sub-components to show detail
@@ -185,7 +181,6 @@ wifi:
     ap_timeout: 45s
 
 captive_portal:
-  id: id_captive_portal
 
 web_server:
   port: 80
@@ -210,15 +205,6 @@ web_server:
 time:
   - platform: sntp
     id: sntp_time
-    on_time:
-      - seconds: 0
-        minutes: 0
-        hours: 0
-        then:
-          - lambda: |-
-              id(days_since_last_bypass)++;
-              id(days_until_bypass_sensor).update(); // Add this line
-              ESP_LOGI("BYPASS", "Days since last protection bypass: %d", id(days_since_last_bypass));
 
 
 # Set pins required for LilyGo T-CAN485 board
@@ -284,6 +270,18 @@ switch:
       sorting_weight: 20
   - platform: factory_reset
     name: "Factory Reset Switch"
+  - platform: template
+    name: "Force Protection Bypass"
+    id: force_bypass_switch
+    icon: mdi:shield-off
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      then:
+        - lambda: 'id(manual_bypass_active) = true;'
+    on_turn_off:
+      then:
+        - lambda: 'id(manual_bypass_active) = false;'
       
 # Tekstsensoren
 text_sensor:
@@ -1571,16 +1569,6 @@ sensor:
       sorting_group_id: Diagnostic
       sorting_weight: 15
 
-  - platform: template
-    name: "Days Until Next Bypass"
-    id: days_until_bypass_sensor
-    lambda: |-
-      return id(bypass_interval_days) - id(days_since_last_bypass);
-    update_interval: never # Updated via button or midnight timer
-    unit_of_measurement: "days"
-    icon: mdi:calendar-clock
-    accuracy_decimals: 0
-
  # Instellingen en modi (Select en Number)
 select:
   - name: "RS485 Control Mode"
@@ -1806,29 +1794,19 @@ number:
       sorting_group_id: Control
       sorting_weight: 8
 
+# --- Configurable Delta for 3.55V Stop Logic ---
   - platform: template
-    name: "Bypass Every X Days"
-    id: bypass_days_ui
-    min_value: 1
-    max_value: 60
-    step: 1
-    initial_value: 15
+    name: "HV Stop Max Delta"
+    id: hv_stop_delta
+    unit_of_measurement: "V"
+    mode: box
+    min_value: 0.01
+    max_value: 0.30
+    step: 0.01
+    initial_value: 0.12
     restore_value: yes
     optimistic: yes
-    mode: box
-    on_value:
-      then:
-        - lambda: 'id(bypass_interval_days) = (int)x;'
-
-button:
-  - platform: template
-    name: "Force Protection Bypass Now"
-    on_press:
-      then:
-        - lambda: |-
-            id(days_since_last_bypass) = id(bypass_interval_days);
-            id(days_until_bypass_sensor).update(); // Force UI update immediately
-            ESP_LOGI("BYPASS", "Bypass manually triggered.");
+    entity_category: config
 
 ###############################################################################
 # LED
@@ -1846,7 +1824,7 @@ light:
     restore_mode: ALWAYS_OFF
 
 interval:
-  # --- 1s INTERVAL: REFINED COULOMB COUNTING & LEARNING ENGINE ---
+   # --- 1s INTERVAL: COULOMB COUNTING & 100%->12% DISCHARGE LEARNING ---
   - interval: 1s
     then:
       - lambda: |-
@@ -1857,57 +1835,41 @@ interval:
           
           if (isnan(p) || isnan(v_min) || isnan(v_max) || isnan(marstek_soc)) return;
 
-          // 1. Precise Integration with Charge Efficiency
+          // 1. SOC Integration
           float delta_wh = (p / 3600.0f);
-          if (p > 0) {
-            // Charging: apply efficiency (96%)
-            id(calc_soc_wh) += (delta_wh * id(charge_efficiency));
-          } else {
-            // Discharging: 1:1 ratio
-            id(calc_soc_wh) += delta_wh; 
-          }
+          id(calc_soc_wh) += (p > 0) ? (delta_wh * id(charge_efficiency)) : delta_wh;
 
-          // 2. TRIGGER: Empty Sync (0% SOC)
-          // Uses both Voltage (3.20V) and Marstek SOC (12%) as the floor
-          if (v_min <= (id(lv_cutoff_v) + 0.01f) || marstek_soc <= 12.0f) { 
-            if (!id(is_learning_cycle)) {
-              id(cycle_energy_accumulator) = 0.0f;
-              id(is_learning_cycle) = true;
-              ESP_LOGI("LEARNING", "Empty floor reached (V:%.2f, BMS:%.0f%%). Learning started.", v_min, marstek_soc);
-            }
+          // 2. TRIGGER: Empty Sync (0%) & End Learning
+          if (v_min <= id(lv_cutoff_v) || marstek_soc <= 12.0f) { 
             id(calc_soc_wh) = 0.0f; 
+            
+            if (id(is_learning_cycle)) {
+              float new_cap = id(cycle_energy_accumulator);
+              if (new_cap > 500.0f) {
+                id(learned_usable_wh) = new_cap;
+                ESP_LOGI("LEARNING", "Cycle complete (100%%->12%%). New capacity: %.1f Wh", new_cap);
+              }
+              id(is_learning_cycle) = false;
+            }
           }
 
-          // 3. Accumulate Energy (Charge Only, RAW power)
-          if (id(is_learning_cycle) && p > 2.0f) {
-             id(cycle_energy_accumulator) += (delta_wh * id(charge_efficiency));
+          // 3. Accumulate Energy (Discharge only for learning)
+          if (id(is_learning_cycle) && p < -2.0f) {
+             id(cycle_energy_accumulator) += fabsf(delta_wh);
           }
 
-          // 4. TRIGGER: Full Sync (100% SOC)
+          // 4. TRIGGER: Full Sync (100%) & Start Learning
           if (v_max >= id(hv_cutoff_v)) {
             id(calc_soc_wh) = id(learned_usable_wh); 
 
-             if (id(is_learning_cycle)) {
-               float new_cap = id(cycle_energy_accumulator);
-               float current_cap = id(learned_usable_wh);
-               
-               // Only process if we accumulated a realistic amount of energy (>500Wh)
-               if (new_cap > 500.0f) {
-                 float deviation = fabsf(new_cap - current_cap) / current_cap;
-                 
-                 // Safety Check: Accept if it's the first time (4000) OR within 20% of current
-                 if (current_cap == 4000.0f || deviation < 0.20f) {
-                   id(learned_usable_wh) = new_cap;
-                   ESP_LOGI("LEARNING", "SUCCESS! New capacity: %.1f Wh (Dev: %.1f%%)", new_cap, deviation * 100.0);
-                 } else {
-                   ESP_LOGW("LEARNING", "REJECTED: New value %.1f Wh varies too much from %.1f Wh", new_cap, current_cap);
-                 }
-               }
-               id(is_learning_cycle) = false; // Reset for next cycle
+            if (marstek_soc >= 100.0f && !id(is_learning_cycle)) {
+              id(cycle_energy_accumulator) = 0.0f;
+              id(is_learning_cycle) = true;
+              ESP_LOGI("LEARNING", "Cycle started at 100%% Marstek SOC.");
             }
           }
 
-          // 5. Safety Bounds
+          // Safety Bounds
           if (id(calc_soc_wh) > id(learned_usable_wh)) id(calc_soc_wh) = id(learned_usable_wh);
           if (id(calc_soc_wh) < 0) id(calc_soc_wh) = 0;
 
@@ -1959,48 +1921,69 @@ interval:
                             green: 0%
                             blue: 0%
 
-  # THE AUTOMATION LOGIC for the cuttoffs based on cell voltages.
+  # --- 1s INTERVAL: AUTOMATION & TAPER LOGIC ---
   - interval: 1s
     then:
       - lambda: |-
           float v_max = id(max_cell_voltage).state;
           float v_min = id(min_cell_voltage).state;
-          if (isnan(v_max) || isnan(v_min)) return;
-          
+          float v_delta = id(cell_voltage_delta).state;
           float current_soc = (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0f;
-          bool is_bypass_day = (id(days_since_last_bypass) >= id(bypass_interval_days) || id(days_until_bypass_sensor).state <= 0);
+          if (isnan(v_max) || isnan(v_min) || isnan(v_delta)) return;
 
-          // 1. Apply Warnings (Tapering)
-          if (v_max > (id(hv_warning_v) + 0.08)) {
-            if (id(max_charge_power).state > 300) id(max_charge_power).make_call().set_value(300).perform();
-          } else if (v_max >= id(hv_warning_v)) {
-            if (id(max_charge_power).state > 600) id(max_charge_power).make_call().set_value(600).perform();
+          if (id(manual_bypass_active)) {
+            if (v_max >= id(hv_cutoff_v) || v_min <= id(lv_cutoff_v)) id(manual_bypass_active) = false;
+            return;
           }
 
-          // 2. Hard Cutoffs
-          if (is_bypass_day) {
-            if (v_max >= id(hv_cutoff_v)) id(days_since_last_bypass) = 0;
-          } else {
+          // Taper Logic with Single-Trigger Shutoff
+          if (!id(charge_cutoff_triggered)) {
             if (v_max >= id(hv_cutoff_v)) {
-              if (id(max_charge_power).state != 0) id(max_charge_power).make_call().set_value(0).perform();
-            }
-            if (v_min <= id(lv_cutoff_v)) {
-              if (id(max_discharge_power).state != 0) id(max_discharge_power).make_call().set_value(0).perform();
+              if (v_delta <= id(hv_stop_delta).state) {
+                id(max_charge_power).make_call().set_value(0).perform();
+                id(charge_cutoff_triggered) = true;
+                id(charge_limit_applied_soc) = current_soc;  // Record SOC at cutoff point
+                ESP_LOGI("TAPER", "Charge cutoff at 3.55V with delta %.3fV. SOC: %.1f%%. Waiting for 10%% drop to %.1f%%",
+                  v_delta, current_soc, (current_soc - id(soc_reset_delta_pct)));
+              }
+            } else if (v_max > 3.48f) {
+              // Only apply taper if not already limited
+              if (id(max_charge_power).state >= id(normal_charge_power)) {
+                id(max_charge_power).make_call().set_value(300).perform();
+                id(charge_limit_applied_soc) = current_soc;  // Record SOC for taper too
+                ESP_LOGI("TAPER", "Taper active at %.2fV with delta %.3fV. SOC: %.1f%%. Waiting for 10%% drop to %.1f%%",
+                  v_max, v_delta, current_soc, (current_soc - id(soc_reset_delta_pct)));
+              }
             }
           }
 
-          // 3. Normalization Resets (10% Change)
-          if (id(max_charge_power).state < id(normal_charge_power)) {
-            if (current_soc > id(charge_limit_applied_soc)) id(charge_limit_applied_soc) = current_soc;
+          // Hard Cutoff (Discharge)
+          if (!id(discharge_cutoff_triggered) && v_min <= id(lv_cutoff_v)) {
+            id(max_discharge_power).make_call().set_value(0).perform();
+            id(discharge_cutoff_triggered) = true;
+            id(discharge_limit_applied_soc) = current_soc;  // Record SOC at discharge cutoff
+            ESP_LOGI("DISCHARGE", "Discharge cutoff at 3.20V. SOC: %.1f%%. Waiting for 10%% rise to %.1f%%",
+              current_soc, (current_soc + id(soc_reset_delta_pct)));
+          }
+          
+          // Charge Limit Reset (10% SOC drop) - applies to both 0W cutoff and 300W taper
+          if (id(max_charge_power).state < id(normal_charge_power) && v_max < 3.45f) {
             if (current_soc <= (id(charge_limit_applied_soc) - id(soc_reset_delta_pct))) {
               id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
+              id(charge_cutoff_triggered) = false;
+              ESP_LOGI("TAPER", "Reset: SOC dropped %.1f%%. Re-enabling charging at %.1f%% SOC", 
+                id(soc_reset_delta_pct), current_soc);
               id(charge_limit_applied_soc) = 0.0f;
             }
           }
-          if (id(max_discharge_power).state < id(normal_discharge_power)) {
-            if (id(discharge_limit_applied_soc) < 0.0f || current_soc < id(discharge_limit_applied_soc)) id(discharge_limit_applied_soc) = current_soc;
+          
+          // Discharge Cutoff Reset (10% SOC rise) - mirrors charge reset logic
+          if (id(discharge_cutoff_triggered) && v_min > id(lv_cutoff_v)) {
             if (current_soc >= (id(discharge_limit_applied_soc) + id(soc_reset_delta_pct))) {
               id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform();
+              id(discharge_cutoff_triggered) = false;
+              ESP_LOGI("DISCHARGE", "Reset: SOC rose %.1f%%. Re-enabling discharge at %.1f%% SOC", 
+                id(soc_reset_delta_pct), current_soc);
               id(discharge_limit_applied_soc) = -1.0f;
             }
           }
