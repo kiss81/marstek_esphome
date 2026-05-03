@@ -29,28 +29,38 @@ esphome:
     then:
       - wait_until:
           lambda: |-
-            return !isnan(id(min_cell_voltage).state) && !isnan(id(battery_power).state);
+            return !isnan(id(min_cell_voltage).state) && !isnan(id(battery_power).state) && !isnan(id(battery_state_of_charge).state);
       - lambda: |-
           // Check if we have a valid restored SOC from a previous session
           if (!id(soc_initialized)) {
-            ESP_LOGI("BOOT", "First run/Reset detected. Initializing SOC from voltage.");
+            ESP_LOGI("BOOT", "First run/Reset detected. Initializing SOC from voltage or Marstek SOC.");
             
             float v = id(min_cell_voltage).state;
             float p = id(battery_power).state;
+            float marstek_soc = id(battery_state_of_charge).state;
             
-            // Voltage Sag Compensation logic
-            v += p/-25000.0f; 
-
             float start_soc_pct = 0.0f;
-            if (v >= 3.47) start_soc_pct = 1.00;
-            else if (v >= 3.35) start_soc_pct = 0.90 + (v - 3.35) * (0.10 / 0.12);
-            else if (v >= 3.25) start_soc_pct = 0.01 + (v - 3.25) * (0.89 / 0.1);
-            else start_soc_pct = 0.0;
+            
+            // Prefer Marstek SOC if available and reasonable (>0)
+            if (marstek_soc > 0.0f) {
+              start_soc_pct = marstek_soc / 100.0f;
+              ESP_LOGI("SOC_INIT", "Using Marstek SOC: %.1f%%", marstek_soc);
+            } else {
+              // Fallback to voltage-based estimation
+              // Voltage Sag Compensation logic
+              v += p/-25000.0f; 
+
+              if (v >= 3.47) start_soc_pct = 1.00;
+              else if (v >= 3.35) start_soc_pct = 0.90 + (v - 3.35) * (0.10 / 0.12);
+              else if (v >= 3.25) start_soc_pct = 0.01 + (v - 3.25) * (0.89 / 0.1);
+              else start_soc_pct = 0.0;
+              
+              ESP_LOGI("SOC_INIT", "Voltage-based Sync: Compensated V: %.3fV -> SOC: %.1f%%", v, start_soc_pct * 100.0);
+            }
             
             id(calc_soc_wh) = start_soc_pct * id(learned_usable_wh);
             id(soc_initialized) = true; // Mark as initialized so this doesn't run on normal restarts
             
-            ESP_LOGI("SOC_INIT", "Voltage-based Sync: Compensated V: %.3fV -> SOC: %.1f Wh", v, id(calc_soc_wh));
           } else {
             // Normal restart: trust the restored value from flash
             ESP_LOGI("BOOT", "Normal restart. Restored SOC: %.1f Wh (%.1f%%)", 
@@ -1859,7 +1869,7 @@ interval:
           }
 
           // 4. TRIGGER: Full Sync (100%) & Start Learning
-          if (v_max >= id(hv_cutoff_v)) {
+          if (v_max >= id(hv_cutoff_v) || marstek_soc >= 100.0f) {
             id(calc_soc_wh) = id(learned_usable_wh); 
 
             if (marstek_soc >= 100.0f && !id(is_learning_cycle)) {
@@ -1946,7 +1956,7 @@ interval:
                 ESP_LOGI("TAPER", "Charge cutoff at 3.55V with delta %.3fV. SOC: %.1f%%. Waiting for 10%% drop to %.1f%%",
                   v_delta, current_soc, (current_soc - id(soc_reset_delta_pct)));
               }
-            } else if (v_max > 3.48f) {
+            } else if (v_max > 3.43f) {
               // Only apply taper if not already limited
               if (id(max_charge_power).state >= id(normal_charge_power)) {
                 id(max_charge_power).make_call().set_value(300).perform();
