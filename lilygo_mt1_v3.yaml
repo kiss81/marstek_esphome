@@ -20,7 +20,7 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  min_version: 2026.4.3
+  min_version: 2026.4.5
   name_add_mac_suffix: false
 
   # Logic to initialize SOC and Capacity on boot based on voltage if no value is restored
@@ -1864,8 +1864,14 @@ interval:
           }
 
           // 3. Accumulate Energy (Discharge only for learning)
-          if (id(is_learning_cycle) && p < -2.0f) {
-             id(cycle_energy_accumulator) += fabsf(delta_wh);
+          if (id(is_learning_cycle)) {
+            if (p < -2.0f) {
+              id(cycle_energy_accumulator) += fabsf(delta_wh);
+            } else if (p > 50.0f) { 
+              // If we start charging more than 50W, the cycle is no longer a "pure" discharge
+              id(is_learning_cycle) = false;
+              ESP_LOGD("LEARNING", "Cycle aborted: Charging detected.");
+            }
           }
 
           // 4. TRIGGER: Full Sync (100%) & Start Learning
