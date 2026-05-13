@@ -73,6 +73,10 @@ esphome:
             id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
           }
 
+          id(cell_balancing_switch).turn_on();
+          id(taper_topoff_charge_switch).turn_on();
+          ESP_LOGI("BOOT", "Cell Balancing and Taper Topoff enabled by default.");
+
 esp32:
   board: esp32dev
   cpu_frequency: 80MHz
@@ -106,10 +110,6 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
-  - id: hv_cutoff_v
-    type: float
-    restore_value: yes
-    initial_value: '3.55' # Updated to 3.55V
   - id: lv_cutoff_v
     type: float
     restore_value: yes
@@ -138,18 +138,22 @@ globals:
     type: float
     restore_value: yes
     initial_value: '2000'
-  - id: manual_bypass_active
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-  - id: charge_cutoff_triggered
-    type: bool
-    restore_value: no
-    initial_value: 'false'
   - id: discharge_cutoff_triggered
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: cell_balancing_triggered
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: cell_balancing_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+  - id: taper_topoff_charge_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
 
 logger:
   level: ERROR  # Set global level to VERBOSE to allow sub-components to show detail
@@ -257,7 +261,7 @@ modbus_controller:
     address: 0x1
     modbus_id: modbus1
     command_throttle: 30ms
-    update_interval: 3s
+    update_interval: 2s
 
 debug:
   update_interval: 10s
@@ -280,18 +284,40 @@ switch:
       sorting_weight: 20
   - platform: factory_reset
     name: "Factory Reset Switch"
+      
   - platform: template
-    name: "Force Protection Bypass"
-    id: force_bypass_switch
-    icon: mdi:shield-off
+    name: "Cell Balancing"
+    id: cell_balancing_switch
+    icon: mdi:scale-balance
     optimistic: true
-    restore_mode: ALWAYS_OFF
-    on_turn_on:
-      then:
-        - lambda: 'id(manual_bypass_active) = true;'
-    on_turn_off:
-      then:
-        - lambda: 'id(manual_bypass_active) = false;'
+    lambda: |-
+      return id(cell_balancing_enabled);
+    turn_on_action:
+      - lambda: |-
+          id(cell_balancing_enabled) = true;
+    turn_off_action:
+      - lambda: |-
+          id(cell_balancing_enabled) = false;
+    web_server:
+      sorting_group_id: Control
+      sorting_weight: 1
+
+  - platform: template
+    name: "Taper Topoff Charge"
+    id: taper_topoff_charge_switch
+    icon: mdi:battery-charging-20
+    optimistic: true
+    lambda: |-
+      return id(taper_topoff_charge_enabled);
+    turn_on_action:
+      - lambda: |-
+          id(taper_topoff_charge_enabled) = true;
+    turn_off_action:
+      - lambda: |-
+          id(taper_topoff_charge_enabled) = false;
+    web_server:
+      sorting_group_id: Control
+      sorting_weight: 2
       
 # Tekstsensoren
 text_sensor:
@@ -484,28 +510,6 @@ text_sensor:
     web_server:
       sorting_group_id: Diagnostic
       sorting_weight: 22
-
-  - name: "Cells Currently Balancing"
-    id: active_balancing_cells
-    icon: mdi:battery-sync
-    platform: template
-    lambda: |-
-      uint16_t flags = (uint16_t)id(marstek_balancing_flag).state;
-      if (flags == 0) {
-        return std::string("None");
-      }
-      std::string result = "";
-      for (int i = 0; i < 16; i++) {
-        if (flags & (1 << i)) {
-          if (!result.empty()) result += ", ";
-          result += std::to_string(i + 1);
-        }
-      }
-      return result;
-    update_interval: 10s
-    web_server:
-      sorting_group_id: Info
-      sorting_weight: 6 # Placed near Inverter State
 
 ## Sensoren
 sensor:
@@ -920,7 +924,7 @@ sensor:
     state_class: measurement
     filters:
       - multiply: 0.001
-    skip_updates: 10
+    skip_updates: 0
     web_server:
       sorting_group_id: Info
       sorting_weight: 24
@@ -1601,7 +1605,7 @@ sensor:
       sorting_group_id: Diagnostic
       sorting_weight: 15
 
-  - name: "Marstek Balancing Flag RAW"
+  - name: "Marstek Balancing Flag"
     id: marstek_balancing_flag
     icon: mdi:battery-sync
     platform: modbus_controller
@@ -1610,6 +1614,7 @@ sensor:
     address: 34009
     value_type: U_WORD
     accuracy_decimals: 0
+    skip_updates: 0
     state_class: measurement
     unit_of_measurement: ""
     web_server:
@@ -1841,20 +1846,6 @@ number:
       sorting_group_id: Control
       sorting_weight: 8
 
-# --- Configurable Delta for 3.55V Stop Logic ---
-  - platform: template
-    name: "HV Stop Max Delta"
-    id: hv_stop_delta
-    unit_of_measurement: "V"
-    mode: box
-    min_value: 0.01
-    max_value: 0.30
-    step: 0.01
-    initial_value: 0.12
-    restore_value: yes
-    optimistic: yes
-    entity_category: config
-
 ###############################################################################
 # LED
 ###############################################################################
@@ -1912,10 +1903,10 @@ interval:
           }
 
           // 4. TRIGGER: Full Sync (100%) & Start Learning
-          if (v_max >= id(hv_cutoff_v) || marstek_soc >= 100.0f) {
+          if (marstek_soc >= 100.0f) {
             id(calc_soc_wh) = id(learned_usable_wh); 
 
-            if (marstek_soc >= 100.0f && !id(is_learning_cycle)) {
+            if (!id(is_learning_cycle)) {
               id(cycle_energy_accumulator) = 0.0f;
               id(is_learning_cycle) = true;
               ESP_LOGI("LEARNING", "Cycle started at 100%% Marstek SOC.");
@@ -1984,28 +1975,24 @@ interval:
           float current_soc = (id(calc_soc_wh) / id(learned_usable_wh)) * 100.0f;
           if (isnan(v_max) || isnan(v_min) || isnan(v_delta)) return;
 
-          if (id(manual_bypass_active)) {
-            if (v_max >= id(hv_cutoff_v) || v_min <= id(lv_cutoff_v)) id(manual_bypass_active) = false;
-            return;
+          // Cell Balancing Logic
+          if (id(cell_balancing_switch).state && !id(cell_balancing_triggered) && (v_max >= 3.60f || id(marstek_balancing_flag).state != 0)) {
+            id(max_charge_power).make_call().set_value(30).perform();
+            id(cell_balancing_triggered) = true;
+            id(charge_limit_applied_soc) = current_soc;  // Record SOC for taper too
+
+            ESP_LOGI("CELL_BALANCING", "Cell balancing triggered at %.2fV, flag %d. Setting charge power to 30W for cell balancing.",
+              v_max, (int)id(marstek_balancing_flag).state);
           }
 
+
           // Taper Logic with Single-Trigger Shutoff
-          if (!id(charge_cutoff_triggered)) {
-            if (v_max >= id(hv_cutoff_v)) {
-              if (v_delta <= id(hv_stop_delta).state) {
-                id(max_charge_power).make_call().set_value(0).perform();
-                id(charge_cutoff_triggered) = true;
-                id(charge_limit_applied_soc) = current_soc;  // Record SOC at cutoff point
-                ESP_LOGI("TAPER", "Charge cutoff at 3.55V with delta %.3fV. SOC: %.1f%%. Waiting for 10%% drop to %.1f%%",
-                  v_delta, current_soc, (current_soc - id(soc_reset_delta_pct)));
-              }
-            } else if (v_max > 3.43f) {
-              // Only apply taper if not already limited
+          if (id(taper_topoff_charge_enabled) && !id(cell_balancing_triggered)) {
+            if (v_max > 3.44f) {
               if (id(max_charge_power).state >= id(normal_charge_power)) {
-                id(max_charge_power).make_call().set_value(300).perform();
-                id(charge_limit_applied_soc) = current_soc;  // Record SOC for taper too
-                ESP_LOGI("TAPER", "Taper active at %.2fV with delta %.3fV. SOC: %.1f%%. Waiting for 10%% drop to %.1f%%",
-                  v_max, v_delta, current_soc, (current_soc - id(soc_reset_delta_pct)));
+                id(max_charge_power).make_call().set_value(200).perform();
+                id(charge_limit_applied_soc) = current_soc;
+                ESP_LOGI("TAPER", "Taper active at %.2fV. SOC: %.1f%%.", v_max, current_soc);
               }
             }
           }
@@ -2018,19 +2005,25 @@ interval:
             ESP_LOGI("DISCHARGE", "Discharge cutoff at 3.20V. SOC: %.1f%%. Waiting for 10%% rise to %.1f%%",
               current_soc, (current_soc + id(soc_reset_delta_pct)));
           }
-          
           // Charge Limit Reset (10% SOC drop) - applies to both 0W cutoff and 300W taper
-          if (id(max_charge_power).state < id(normal_charge_power) && v_max < 3.45f) {
+          if (id(max_charge_power).state < id(normal_charge_power)) {
             if (current_soc <= (id(charge_limit_applied_soc) - id(soc_reset_delta_pct))) {
               id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
-              id(charge_cutoff_triggered) = false;
-              ESP_LOGI("TAPER", "Reset: SOC dropped %.1f%%. Re-enabling charging at %.1f%% SOC", 
-                id(soc_reset_delta_pct), current_soc);
+              id(cell_balancing_triggered) = false; // Add this line to allow re-balancing
+              ESP_LOGI("TAPER", "Reset: SOC dropped. Re-enabling charging/balancing.");
               id(charge_limit_applied_soc) = 0.0f;
+            }
+            else if (id(cell_balancing_switch).state && id(marstek_balancing_flag).state == 0)
+            {
+              if (id(max_charge_power).state < 200) {
+                id(max_charge_power).make_call().set_value(200).perform();
+                id(cell_balancing_triggered) = false; // Add this line to allow re-balancing
+                ESP_LOGI("TAPER", "Reset: Balancing dropped. Re-enabling charging/balancing.");
+              }
             }
           }
           
-          // Discharge Cutoff Reset (10% SOC rise) - mirrors charge reset logic
+          // Discharge Cutoff Reset (10% SOC rise)
           if (id(discharge_cutoff_triggered) && v_min > id(lv_cutoff_v)) {
             if (current_soc >= (id(discharge_limit_applied_soc) + id(soc_reset_delta_pct))) {
               id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform();
