@@ -68,9 +68,10 @@ esphome:
           }
 
           // Initialize power limits to defaults
+          // [MODBUS WRITE] Writing to registers 44002 (max_charge_power) and 44003 (max_discharge_power)
           if (!isnan(id(max_discharge_power).state)) {
-            id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform();
-            id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
+            id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform(); // MODBUS WRITE to 0xAC93 (44003)
+            id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform(); // MODBUS WRITE to 0xAC92 (44002)
           }
 
           id(cell_balancing_switch).turn_on();
@@ -1977,6 +1978,7 @@ interval:
 
           // Cell Balancing Logic
           if (id(cell_balancing_switch).state && !id(cell_balancing_triggered) && (v_max >= 3.60f || id(marstek_balancing_flag).state != 0)) {
+            // [MODBUS WRITE] Writing to register 44002 (max_charge_power) - reduce charge power for cell balancing
             id(max_charge_power).make_call().set_value(30).perform();
             id(cell_balancing_triggered) = true;
             id(charge_limit_applied_soc) = current_soc;  // Record SOC for taper too
@@ -1990,6 +1992,7 @@ interval:
           if (id(taper_topoff_charge_enabled) && !id(cell_balancing_triggered)) {
             if (v_max > 3.44f) {
               if (id(max_charge_power).state >= id(normal_charge_power)) {
+                // [MODBUS WRITE] Writing to register 44002 (max_charge_power) - taper charging at 200W
                 id(max_charge_power).make_call().set_value(200).perform();
                 id(charge_limit_applied_soc) = current_soc;
                 ESP_LOGI("TAPER", "Taper active at %.2fV. SOC: %.1f%%.", v_max, current_soc);
@@ -1999,6 +2002,7 @@ interval:
 
           // Hard Cutoff (Discharge)
           if (!id(discharge_cutoff_triggered) && v_min <= id(lv_cutoff_v)) {
+            // [MODBUS WRITE] Writing to register 44003 (max_discharge_power) - disable discharge at low voltage
             id(max_discharge_power).make_call().set_value(0).perform();
             id(discharge_cutoff_triggered) = true;
             id(discharge_limit_applied_soc) = current_soc;  // Record SOC at discharge cutoff
@@ -2008,6 +2012,7 @@ interval:
           // Charge Limit Reset (10% SOC drop) - applies to both 0W cutoff and 300W taper
           if (id(max_charge_power).state < id(normal_charge_power)) {
             if (current_soc <= (id(charge_limit_applied_soc) - id(soc_reset_delta_pct))) {
+              // [MODBUS WRITE] Writing to register 44002 (max_charge_power) - restore normal charge power after cutoff
               id(max_charge_power).make_call().set_value(id(normal_charge_power)).perform();
               id(cell_balancing_triggered) = false; // Add this line to allow re-balancing
               ESP_LOGI("TAPER", "Reset: SOC dropped. Re-enabling charging/balancing.");
@@ -2016,6 +2021,7 @@ interval:
             else if (id(cell_balancing_switch).state && id(marstek_balancing_flag).state == 0)
             {
               if (id(max_charge_power).state < 200) {
+                // [MODBUS WRITE] Writing to register 44002 (max_charge_power) - restore 200W after balancing flag clears
                 id(max_charge_power).make_call().set_value(200).perform();
                 id(cell_balancing_triggered) = false; // Add this line to allow re-balancing
                 ESP_LOGI("TAPER", "Reset: Balancing dropped. Re-enabling charging/balancing.");
@@ -2026,6 +2032,7 @@ interval:
           // Discharge Cutoff Reset (10% SOC rise)
           if (id(discharge_cutoff_triggered) && v_min > id(lv_cutoff_v)) {
             if (current_soc >= (id(discharge_limit_applied_soc) + id(soc_reset_delta_pct))) {
+              // [MODBUS WRITE] Writing to register 44003 (max_discharge_power) - restore normal discharge power
               id(max_discharge_power).make_call().set_value(id(normal_discharge_power)).perform();
               id(discharge_cutoff_triggered) = false;
               ESP_LOGI("DISCHARGE", "Reset: SOC rose %.1f%%. Re-enabling discharge at %.1f%% SOC", 
